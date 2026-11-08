@@ -1,0 +1,24 @@
+SilphMod — third-party components
+
+The MIT license applies to original SilphMod code and documentation.
+Dependencies retain their own licenses.
+
+ShadowHook 2.0.1, revision 854c775c2c3676e57a0f383597ebf420b5204161:
+https://github.com/bytedance/android-inline-hook
+MIT, including the upstream xDL, BSD and Linux syscall support notices
+in app/src/main/assets/licenses. Sources are obtained at build time.
+
+Gradle wrapper and Android Gradle Plugin: Apache-2.0.
+https://github.com/gradle/gradle
+https://android.googlesource.com/platform/tools/base/
+License: tools/licenses/Apache-2.0.txt.
+
+Pokémon and item artwork belongs to its respective game rightsholders
+and is not licensed under the project MIT license. Selector artwork:
+https://github.com/PokeMiners/pogo_assets
+https://github.com/PokeAPI/sprites
+Asset sources and hashes: tools/pokemon-assets.json and item-artwork.json.
+The PokeAPI sprites notice is retained in app/src/main/assets/licenses.
+The released-species catalog originates from pogoapi.net.
+
+The project does not distribute game libraries or decompiled game metadata.

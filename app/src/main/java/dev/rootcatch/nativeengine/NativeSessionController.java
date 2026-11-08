@@ -1,0 +1,107 @@
+package dev.rootcatch.nativeengine;
+
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public final class NativeSessionController {
+    public interface Listener {
+        void status(String message);
+        void update(NativeSessionWire.Snapshot snapshot,NativeSessionState.Totals totals);
+        void finished(String reason,boolean cleanupConfirmed);
+        default void candidate(NativeKecleonWire.Event event){ }
+        default void reply(long executed){ }
+    }
+    private static final Pattern CONNECTED=Pattern.compile("\\{\"event\":\"native_control_connected\",\"pid\":([0-9]+),\"serverUid\":([0-9]+)\\}");
+    private static final Pattern REPLY=Pattern.compile("\\{\"event\":\"native_control_reply\",\"sequence\":\"([0-9]+)\",\"command\":([0-9]+),\"status\":([0-9]+),\"state\":([0-9]+),\"reason\":([0-9]+),\"queued\":([0-9]+),\"readOnly\":([01]),\"executed\":\"([0-9]+)\",\"canceled\":\"([0-9]+)\",\"pulses\":\"([0-9]+)\"\\}");
+    private static final Pattern SNAPSHOT=Pattern.compile("\\{\"event\":\"native_engine_snapshot\",\"bytes\":\"([a-f0-9]{512})\"\\}");
+    private final NativeSessionWire.Config config;
+    private final NativeSessionState state;
+    private final Consumer<String> sender;
+    private final Listener listener;
+    private boolean connected,configured,finished,foreground=true;
+    private int pending;
+    private final java.util.ArrayDeque<String> commands=new java.util.ArrayDeque<>();
+    private String inflight;
+    private boolean pendingConfig;
+    private long eventSequence;
+    private String lastEvent="";
+    private long sequence;
+    private String stopReason="",lastStatus="";
+    public NativeSessionController(NativeSessionWire.Config config,NativeSessionState.Totals baseline,Consumer<String> sender,Listener listener){
+        if(sender==null||listener==null)throw new IllegalArgumentException("Missing native controller callbacks");
+        this.config=NativeSessionWire.decodeConfig(config.encode());this.state=new NativeSessionState(this.config,baseline);this.sender=sender;this.listener=listener;
+    }
+    public synchronized void accept(String line){
+        if(finished)return;if(line==null||line.length()>4096)throw new IllegalStateException("Invalid native controller output");
+        Matcher match=CONNECTED.matcher(line);
+        if(match.matches()){
+            if(connected||Integer.parseInt(match.group(1))!=config.pid)throw new IllegalStateException("Native connection identity changed");
+            connected=true;pendingConfig=true;send(config.command(),4);status("Configuring native engine…");return;
+        }
+        match=REPLY.matcher(line);
+        if(match.matches()){
+            long next=Long.parseLong(match.group(1));int command=Integer.parseInt(match.group(2)),result=Integer.parseInt(match.group(3));
+            if(!connected||next!=sequence+1||command!=pending||command<1||command>4)throw new IllegalStateException("Unexpected native control response");
+            sequence=next;pending=0;
+            if(command==4){
+                if(result==2){if(pendingConfig)throw new IllegalStateException("Native configuration busy");commands.addFirst(inflight);}
+                else if(result!=0)throw new IllegalStateException("Native command rejected: "+result);
+                else if(pendingConfig){configured=true;pendingConfig=false;}inflight=null;
+            }
+            else if(result!=0&&result!=2&&result!=3)throw new IllegalStateException("Native control rejected: "+result);
+            listener.reply(Long.parseUnsignedLong(match.group(8)));
+            return;
+        }
+        match=SNAPSHOT.matcher(line);
+        if(match.matches()){
+            if(!configured)throw new IllegalStateException("Native snapshot before configuration");
+            if(state.accept(NativeSessionWire.unhex(match.group(1))))listener.update(state.snapshot(),state.totals());
+            if(state.stopped()){
+                finished=true;NativeSessionWire.Snapshot value=state.snapshot();
+                String reason=value.reason==1?"Lobby below minimum players":value.reason==5?"Maximum raids reached":value.reason==8?"Pokémon storage full":value.reason==9?"Not enough healing items":value.reason==6?"No raid candidates":value.reason==14?"No raid pass (daily free pass already used)":"Raid session finished";
+                listener.finished(!stopReason.isEmpty()?stopReason:value.error!=0?(value.mode==NativeSessionWire.RAID?raidError(value.error):"Native engine error: "+value.error):reason,state.cleanupConfirmed());
+            }else if(state.ready())status(!stopReason.isEmpty()?"Stopping…":!foreground?"Paused":activityStatus());
+            return;
+        }
+        String prefix="{\"event\":\"native_kecleon_event\",\"bytes\":\"";
+        if(line.startsWith(prefix)&&line.endsWith("\"}")){
+            String hex=line.substring(prefix.length(),line.length()-2);
+            NativeKecleonWire.Event event=NativeKecleonWire.decode(NativeSessionWire.unhex(hex));event.bind(config);
+            NativeSessionWire.Snapshot latest=state.snapshot();
+            if(latest==null)throw new IllegalStateException("Kecleon event before snapshot");
+            if(event.accountHi!=latest.accountHi||event.accountLo!=latest.accountLo){
+                if(latest.accountHi==0&&latest.accountLo==0&&(event.accountHi!=0||event.accountLo!=0)){}
+                else throw new IllegalStateException("Kecleon account mismatch");
+            }
+            if(event.sequence<eventSequence||event.sequence==eventSequence&&!lastEvent.equals(hex))throw new IllegalStateException("Stale Kecleon event");
+            if(event.sequence>eventSequence){eventSequence=event.sequence;lastEvent=hex;listener.candidate(event);}return;
+        }
+        throw new IllegalStateException("Unexpected native controller output");
+    }
+    public synchronized void pulse(boolean foreground){
+        this.foreground=foreground;if(finished||!connected||!configured||pending!=0)return;
+        String command=state.command(foreground);if(command==null)return;
+        if(stopReason.isEmpty()&&foreground&&!commands.isEmpty()){inflight=commands.removeFirst();send(inflight,4);return;}
+        send(command,command.equals("stop")?2:command.equals("status")?3:1);
+        if(!stopReason.isEmpty())status("Stopping…");else if(state.ready())status(!foreground?"Paused":activityStatus());
+    }
+    public synchronized void requestStop(String reason){if(!finished){if(stopReason.isEmpty())stopReason=reason==null||reason.isEmpty()?"Stopped by user":reason;state.requestStop();}}
+    public synchronized void disconnected(){if(!finished){finished=true;listener.finished(!stopReason.isEmpty()?stopReason:"Native control disconnected",false);}}
+    public synchronized boolean finished(){return finished;}
+    public synchronized boolean active(){return !finished&&state.ready()&&foreground&&stopReason.isEmpty();}
+    public synchronized NativeSessionState.Totals totals(){return state.totals();}
+    public synchronized void enqueue(String command){if(finished||!stopReason.isEmpty())return;if(command==null||!command.matches("engine [a-f0-9]{1024}")||commands.size()>=8)throw new IllegalStateException("Native command queue full or invalid");commands.addLast(command);}
+    private void send(String text,int command){if(pending!=0)throw new IllegalStateException("Native request still pending");pending=command;sender.accept(text);}
+    private String activityStatus(){NativeSessionWire.Snapshot s=state.snapshot();if(s.reason==12)return "Checking buddy…";if(s.reason==13)return "Removing buddy…";
+        if(s.mode==NativeSessionWire.RAID){int phase=s.candidateState%100,stage=s.candidateState/100;
+            return switch(phase){case 1->"Raid: anchor…";case 2->"Raid: traveling…";case 3->"Raid: scanning gyms…";case 4->"Raid: approaching…";
+                case 5->switch(stage){case 1->"Raid: joining…";case 2->"Raid: lobby…";case 3->"Raid: battle…";case 4->"Raid: catch…";case 5->"Raid: bonus…";case 6->"Raid: healing…";default->"Raid active…";};
+                case 6->"Raid: teleport…";case 7->"Raid: next…";default->"Active";};}
+        if(s.mode!=3)return "Active";int phase=s.candidateState%100,stage=s.candidateState/100;
+        return switch(phase){case 1->"Finding Rockets…";case 2->"Traveling…";case 3->"Loading map…";case 4->"Checking Rocket…";
+            case 5->switch(stage){case 1->"Opening Rocket…";case 2->"Preparing team…";case 3->"Battling…";case 4->"Opening encounter…";case 5->"Catching…";case 6->"Healing team…";case 8->"Closing battle…";default->"Active";};
+            case 6->stage==5?"Returning to catch location…":"Loading map…";case 7->"Next candidate…";default->"Active";};}
+    private void status(String value){if(!lastStatus.equals(value)){lastStatus=value;listener.status(value);}}
+    private static String raidError(int error){return switch(error){case 113->"Battle action timed out";case 116->"Team healing failed";case 117->"Team not ready; heal or change team";case 118->"Capture location not confirmed";case 119->"Team health update timed out";case 120->"Capture screen did not close";case 121->"Recommended team unavailable";default->"Raid engine error: "+error;};}
+}
